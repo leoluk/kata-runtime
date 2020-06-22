@@ -644,6 +644,9 @@ func (s *Sandbox) createCgroupManager() error {
 		// sandbox and update the list of devices with the devices hotplugged in the
 		// hypervisor.
 		resources = *spec.Linux.Resources
+
+		//TODO: do we actually want to apply all the resources in this case, all the time? how do we
+		// differentiate ?when? to set in case of k8s v docker?
 	}
 
 	if s.devManager != nil {
@@ -1168,7 +1171,7 @@ func (s *Sandbox) CreateContainer(contConfig ContainerConfig) (VCContainer, erro
 		}
 	}()
 
-	// Sandbox is reponsable to update VM resources needed by Containers
+	// Sandbox is responsible to update VM resources needed by Containers
 	// Update resources after having added containers to the sandbox, since
 	// container status is requiered to know if more resources should be added.
 	err = s.updateResources()
@@ -1281,6 +1284,13 @@ func (s *Sandbox) DeleteContainer(containerID string) (VCContainer, error) {
 			break
 		}
 	}
+
+	// EGE: TODO: resize the sandbox cgroup accordingly if CPUSETS are used, or if
+	// we are managing the group (!SandboxCgroupOnly)
+	// s.updateResources?
+	//s.cgroupsUpdate()
+
+	// update pod sandbox/VMresources based on deletion
 
 	if err = s.storeSandbox(); err != nil {
 		return nil, err
@@ -1483,7 +1493,7 @@ func (s *Sandbox) createContainers() error {
 	}
 
 	// Update resources after having added containers to the sandbox, since
-	// container status is requiered to know if more resources should be added.
+	// container status is required to know if more resources should be added.
 	if err := s.updateResources(); err != nil {
 		return err
 	}
@@ -1902,45 +1912,17 @@ func (s *Sandbox) GetHypervisorType() string {
 	return string(s.config.HypervisorType)
 }
 
-// cgroupsUpdate will:
-//  1) get the v1constraints cgroup associated with the stored cgroup path
-//  2) (re-)add hypervisor vCPU threads to the appropriate cgroup
-//  3) If we are managing sandbox cgroup, update the v1constraints cgroup size
+// cgroupsUpdate will update the sandboxcgroup's cpuset values, and if SandboxCgroupOnly is false,
+// it will update cgroup sizing based on the current sandbox's resource values
 func (s *Sandbox) cgroupsUpdate() error {
 
-	// If Kata is configured for SandboxCgroupOnly, the VMM and its processes are already
-	// in the Kata sandbox cgroup (inherited). No need to move threads/processes, and we should
-	// rely on parent's cgroup CPU/memory values
 	if s.config.SandboxCgroupOnly {
-		return nil
+		// only want to apply cpuset - we aren't managing the sandbox otherwise
+		// do some fucked up scrub thing to apply *just* the one?
 	}
 
-	if s.state.CgroupPath == "" {
-		s.Logger().Warn("sandbox's cgroup won't be updated: cgroup path is empty")
-		return nil
-	}
-
-	cgroup, err := cgroupsLoadFunc(V1Constraints, cgroups.StaticPath(s.state.CgroupPath))
-	if err != nil {
-		return fmt.Errorf("Could not load cgroup %v: %v", s.state.CgroupPath, err)
-	}
-
-	if err := s.constrainHypervisor(cgroup); err != nil {
-		return err
-	}
-
-	if len(s.containers) <= 1 {
-		// nothing to update
-		return nil
-	}
-
-	resources, err := s.resources()
-	if err != nil {
-		return err
-	}
-
-	if err := cgroup.Update(&resources); err != nil {
-		return fmt.Errorf("Could not update sandbox cgroup path='%v' error='%v'", s.state.CgroupPath, err)
+	if err := s.cgroupMgr.Apply(); err != nil {
+		return fmt.Errorf("Could not update the cgroup %v", err)
 	}
 
 	return nil
@@ -2169,6 +2151,7 @@ func (s *Sandbox) setupSandboxCgroup() error {
 
 	s.state.CgroupPaths = s.cgroupMgr.GetPaths()
 
+	// EGE: TODO: ** DO ** we want to update the resource list pending if its kube or not? We want to just inherit?
 	if err = s.cgroupMgr.Apply(); err != nil {
 		return fmt.Errorf("Could not constrain cgroup: %v", err)
 	}

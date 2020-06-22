@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/containerd/cgroups"
-	vccgroups "github.com/kata-containers/runtime/virtcontainers/pkg/cgroups"
 	vcTypes "github.com/kata-containers/runtime/virtcontainers/pkg/types"
 	"github.com/kata-containers/runtime/virtcontainers/types"
 	"github.com/kata-containers/runtime/virtcontainers/utils"
@@ -29,7 +28,6 @@ import (
 
 	"github.com/kata-containers/runtime/virtcontainers/device/config"
 	"github.com/kata-containers/runtime/virtcontainers/device/manager"
-	"github.com/kata-containers/runtime/virtcontainers/pkg/rootless"
 	"github.com/kata-containers/runtime/virtcontainers/store"
 )
 
@@ -941,12 +939,6 @@ func (c *Container) create() (err error) {
 		}
 	}
 
-	if !rootless.IsRootless() && !c.sandbox.config.SandboxCgroupOnly {
-		if err = c.cgroupsCreate(); err != nil {
-			return
-		}
-	}
-
 	if err = c.setContainerState(types.StateReady); err != nil {
 		return
 	}
@@ -963,13 +955,6 @@ func (c *Container) delete() error {
 	// Remove the container from sandbox structure
 	if err := c.sandbox.removeContainer(c.id); err != nil {
 		return err
-	}
-
-	// If running rootless, there are no cgroups to remove
-	if !c.sandbox.config.SandboxCgroupOnly || !rootless.IsRootless() {
-		if err := c.cgroupsDelete(); err != nil {
-			return err
-		}
 	}
 
 	return c.sandbox.storeSandbox()
@@ -1249,6 +1234,12 @@ func (c *Container) update(resources specs.LinuxResources) error {
 		if q := cpu.Quota; q != nil && *q != 0 {
 			c.config.Resources.CPU.Quota = q
 		}
+
+		// Static CPU policies are not currently enforced within the guest, but will
+		// be utilized for cpuset cgroup for the sandbox on the host. Make available
+		// to agent for now.
+		c.config.Resources.CPU.Cpus = cpu.Cpus
+		c.config.Resources.CPU.Mems = cpu.Mems
 	}
 
 	if c.config.Resources.Memory == nil {
@@ -1259,12 +1250,13 @@ func (c *Container) update(resources specs.LinuxResources) error {
 		c.config.Resources.Memory.Limit = mem.Limit
 	}
 
+	// Resize VM if necessary:
 	if err := c.sandbox.updateResources(); err != nil {
 		return err
 	}
 
 	if !c.sandbox.config.SandboxCgroupOnly {
-		if err := c.cgroupsUpdate(resources); err != nil {
+		if err := c.updateHostCgroups(resources); err != nil {
 			return err
 		}
 	}
@@ -1467,45 +1459,6 @@ func (c *Container) detachDevices() error {
 	return nil
 }
 
-// cgroupsCreate creates cgroups on the host for the associated container
-func (c *Container) cgroupsCreate() (err error) {
-	spec := c.GetPatchedOCISpec()
-	if spec == nil {
-		return errorMissingOCISpec
-	}
-
-	// https://github.com/kata-containers/runtime/issues/168
-	resources := specs.LinuxResources{
-		CPU: nil,
-	}
-
-	if spec.Linux != nil && spec.Linux.Resources != nil {
-		resources.CPU = validCPUResources(spec.Linux.Resources.CPU)
-	}
-
-	c.state.CgroupPath, err = vccgroups.ValidCgroupPath(spec.Linux.CgroupsPath, c.sandbox.config.SystemdCgroup)
-	if err != nil {
-		return fmt.Errorf("Invalid cgroup path: %v", err)
-	}
-
-	cgroup, err := cgroupsNewFunc(cgroups.V1,
-		cgroups.StaticPath(c.state.CgroupPath), &resources)
-	if err != nil {
-		return fmt.Errorf("Could not create cgroup for %v: %v", c.state.CgroupPath, err)
-	}
-
-	c.config.Resources = resources
-
-	// Add shim into cgroup
-	if c.process.Pid > 0 {
-		if err := cgroup.Add(cgroups.Process{Pid: c.process.Pid}); err != nil {
-			return fmt.Errorf("Could not add PID %d to cgroup %v: %v", c.process.Pid, spec.Linux.CgroupsPath, err)
-		}
-	}
-
-	return nil
-}
-
 // cgroupsDelete deletes the cgroups on the host for the associated container
 func (c *Container) cgroupsDelete() error {
 
@@ -1547,8 +1500,8 @@ func (c *Container) cgroupsDelete() error {
 	return nil
 }
 
-// cgroupsUpdate updates cgroups on the host for the associated container
-func (c *Container) cgroupsUpdate(resources specs.LinuxResources) error {
+// updateHostCgroups: updates cgroups on the host for the associated container
+func (c *Container) updateHostCgroups(resources specs.LinuxResources) error {
 
 	if c.state.CgroupPath == "" {
 		c.Logger().Debug("container does not have host cgroups: nothing to update")

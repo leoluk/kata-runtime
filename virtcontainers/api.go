@@ -101,10 +101,14 @@ func createSandboxFromConfig(ctx context.Context, sandboxConfig SandboxConfig, f
 	}()
 
 	// Move runtime to sandbox cgroup so all process are created there.
-	if s.config.SandboxCgroupOnly {
-		if err := s.setupSandboxCgroup(); err != nil {
-			return nil, err
-		}
+	// EGE: TODO: We really needn't even create a sandbox cgroup unless
+	// cpusets are being introduced if we are integrated with a solution like
+	// Kubernetes (ie, where kubelet creates the sandbox for us).
+	// As is, we can just create one and inherit from our parent. In the case of k8s
+	// we won't set any values except cpuset if static. In non-pod scenarios, we can
+	// update this cgroup's settings, and avoid creating "container" cgroups on the host.
+	if err := s.setupSandboxCgroup(); err != nil {
+		return nil, err
 	}
 
 	// Start the VM
@@ -160,6 +164,8 @@ func DeleteSandbox(ctx context.Context, sandboxID string) (VCSandbox, error) {
 		return nil, err
 	}
 	defer s.releaseStatelessSandbox()
+
+	//EGE: TODO: we shuold delete the sandbox cgroup?
 
 	// Delete it.
 	if err := s.Delete(); err != nil {
